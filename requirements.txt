@@ -1,0 +1,7 @@
+pikepdf>=8.0.0
+pdfplumber>=0.10.0
+gspread>=6.0.0
+google-api-python-client>=2.100.0
+google-auth>=2.20.0
+Pillow>=10.0.0
+winocr>=0.0.15; sys_platform == 'win32'
