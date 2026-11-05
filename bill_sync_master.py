@@ -154,10 +154,27 @@ def get_or_create_bank_sheet(spreadsheet, bank_name: str, rebuild: bool = False)
         sheet.append_row(TABLE_HEADERS)
     return sheet
 
+def sort_tx_rows(rows: list) -> list:
+    """
+    依消費日期倒序 (降冪) 排序，次以入帳日期排序
+    Sort transaction rows in descending order by transaction date (Col B), then post date (Col C).
+
+    :param rows: List[List] 交易明細清單
+    :return: List[List] 排序後的交易明細清單
+    """
+    return sorted(
+        rows,
+        key=lambda r: (
+            str(r[1]).strip() if len(r) > 1 else "",
+            str(r[2]).strip() if len(r) > 2 else ""
+        ),
+        reverse=True
+    )
+
 def compact_bank_sheet_if_needed(spreadsheet, sheet):
     """
-    檢查銀行分頁是否含有空白斷層，若有則自動自癒壓縮 (Compact)
-    Check if a bank worksheet contains empty row gaps and compact it automatically.
+    檢查銀行分頁是否含有空白斷層或未按日期倒序排列，若有則自動自癒壓縮與重組
+    Check if a bank worksheet contains empty gaps or unordered rows, compacting and sorting them descending.
 
     :param spreadsheet: gspread.Spreadsheet 試算表實例
     :param sheet: gspread.Worksheet 銀行分頁實例
@@ -181,30 +198,36 @@ def compact_bank_sheet_if_needed(spreadsheet, sheet):
         if len(r) > 1 and str(r[1]).strip() != ""
     ]
 
-    # 若總列數大於有效資料列數，代表中間有空白斷層或末端有孤立空行
-    if len(raw_data_rows) > len(valid_rows):
-        empty_count = len(raw_data_rows) - len(valid_rows)
-        print(f"    🧹 偵測到【{sheet.title}】存在 {empty_count} 筆空白斷層列，啟動自癒壓縮...")
+    # 進行消費日期倒序 (降冪) 排序 (最新消費置頂)
+    sorted_rows = sort_tx_rows(valid_rows)
+
+    # 判斷是否需要更新：有空白斷層，或者順序未按日期倒序
+    has_empty_gaps = len(raw_data_rows) > len(valid_rows)
+    needs_reorder = (raw_data_rows != sorted_rows)
+
+    if has_empty_gaps or needs_reorder:
+        reason_msg = "消除空白斷層並依日期倒序排列" if has_empty_gaps else "依消費日期倒序重組 (最新置頂)"
+        print(f"    🧹 整理【{sheet.title}】明細 ({reason_msg}，共 {len(sorted_rows)} 筆)...")
         sheet.clear()
         
         # 規整工作表網格大小 (資料列 + 表頭 + 10 列緩衝，最少 20 列)
-        compact_grid_rows = max(len(valid_rows) + 1 + 10, 20)
+        compact_grid_rows = max(len(sorted_rows) + 1 + 10, 20)
         try:
             sheet.resize(rows=compact_grid_rows, cols=len(TABLE_HEADERS))
         except Exception:
             pass
 
         # 批次寫入乾淨連續資料 (完整保留歷史 TRUE/FALSE 勾選狀態)
-        write_values = [header] + valid_rows
+        write_values = [header] + sorted_rows
         sheet.update(range_name="A1", values=write_values, value_input_option="USER_ENTERED")
-        print(f"    ✨【{sheet.title}】壓縮自癒完成，目前有效明細共 {len(valid_rows)} 筆")
+        print(f"    ✨【{sheet.title}】整理完成，最新消費紀錄已置頂")
 
-    return len(valid_rows) + 1
+    return len(sorted_rows) + 1
 
 def append_bank_transactions(sheet, new_rows: list):
     """
-    安全將交易明細寫入銀行分頁，自動計算真實資料尾端，杜絕產生空行
-    Safely append transactions to the bank worksheet without leaving empty row gaps.
+    安全將交易明細寫入銀行分頁，自動依消費日期倒序重組，杜絕產生空行
+    Safely append transactions to the bank worksheet in descending date order without gaps.
 
     :param sheet: gspread.Worksheet 目標銀行工作表
     :param new_rows: List[List] 本次解析出的新交易明細清單
@@ -227,8 +250,8 @@ def append_bank_transactions(sheet, new_rows: list):
         if len(r) > 1 and str(r[1]).strip() != ""
     ]
 
-    # 合併歷史有效資料與本次新增明細
-    combined_rows = valid_historical_rows + new_rows
+    # 合併歷史有效資料與本次新增明細，並一律依消費日期倒序排序
+    combined_rows = sort_tx_rows(valid_historical_rows + new_rows)
     total_records = len(combined_rows)
 
     # 確保工作表網格空間充足 (資料列 + 表頭 + 10 列緩衝，最少 20 列)
