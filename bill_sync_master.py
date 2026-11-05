@@ -134,20 +134,136 @@ def init_google_clients():
     return drive_service, spreadsheet, sheet_master, sheet_logs
 
 def get_or_create_bank_sheet(spreadsheet, bank_name: str, rebuild: bool = False):
-    """取得或建立指定銀行的專屬工作表"""
+    """
+    取得或建立指定銀行的專屬工作表
+    Get or create a dedicated worksheet for the specified bank.
+
+    :param spreadsheet: gspread.Spreadsheet 目標試算表實例
+    :param bank_name: str 銀行名稱 (工作表標題)
+    :param rebuild: bool 是否為全量重建模式 (清空既有內容)
+    :return: gspread.Worksheet 銀行工作表物件
+    """
     try:
         sheet = spreadsheet.worksheet(bank_name)
         if rebuild:
             sheet.clear()
             sheet.append_row(TABLE_HEADERS)
     except gspread.exceptions.WorksheetNotFound:
-        sheet = spreadsheet.add_worksheet(title=bank_name, rows=1000, cols=10)
+        # 初始建立預留 50 列，避免盲目預建過多空白列
+        sheet = spreadsheet.add_worksheet(title=bank_name, rows=50, cols=len(TABLE_HEADERS))
         sheet.append_row(TABLE_HEADERS)
     return sheet
 
-def format_bank_sheet(spreadsheet, sheet, bank_name: str):
-    """為銀行分頁套用專業金融排版、凍結首列、Checkbox、警示條件式格式化與自動欄寬"""
+def compact_bank_sheet_if_needed(spreadsheet, sheet):
+    """
+    檢查銀行分頁是否含有空白斷層，若有則自動自癒壓縮 (Compact)
+    Check if a bank worksheet contains empty row gaps and compact it automatically.
+
+    :param spreadsheet: gspread.Spreadsheet 試算表實例
+    :param sheet: gspread.Worksheet 銀行分頁實例
+    :return: int 整理後的有效總列數 (含表頭)
+    """
+    try:
+        all_values = sheet.get_all_values()
+    except Exception as e:
+        print(f"    ⚠️ 讀取分頁資料異常 ({sheet.title}): {e}")
+        return 1
+
+    if not all_values or len(all_values) <= 1:
+        return 1
+
+    header = all_values[0]
+    raw_data_rows = all_values[1:]
+    
+    # 判斷真實資料列：消費日期 (Col B, index 1) 不得為空
+    valid_rows = [
+        r for r in raw_data_rows 
+        if len(r) > 1 and str(r[1]).strip() != ""
+    ]
+
+    # 若總列數大於有效資料列數，代表中間有空白斷層或末端有孤立空行
+    if len(raw_data_rows) > len(valid_rows):
+        empty_count = len(raw_data_rows) - len(valid_rows)
+        print(f"    🧹 偵測到【{sheet.title}】存在 {empty_count} 筆空白斷層列，啟動自癒壓縮...")
+        sheet.clear()
+        
+        # 規整工作表網格大小 (資料列 + 表頭 + 10 列緩衝，最少 20 列)
+        compact_grid_rows = max(len(valid_rows) + 1 + 10, 20)
+        try:
+            sheet.resize(rows=compact_grid_rows, cols=len(TABLE_HEADERS))
+        except Exception:
+            pass
+
+        # 批次寫入乾淨連續資料 (完整保留歷史 TRUE/FALSE 勾選狀態)
+        write_values = [header] + valid_rows
+        sheet.update(range_name="A1", values=write_values, value_input_option="USER_ENTERED")
+        print(f"    ✨【{sheet.title}】壓縮自癒完成，目前有效明細共 {len(valid_rows)} 筆")
+
+    return len(valid_rows) + 1
+
+def append_bank_transactions(sheet, new_rows: list):
+    """
+    安全將交易明細寫入銀行分頁，自動計算真實資料尾端，杜絕產生空行
+    Safely append transactions to the bank worksheet without leaving empty row gaps.
+
+    :param sheet: gspread.Worksheet 目標銀行工作表
+    :param new_rows: List[List] 本次解析出的新交易明細清單
+    :return: int 寫入後的資料總列數 (含表頭)
+    """
+    if not new_rows:
+        try:
+            return len(sheet.col_values(2))
+        except Exception:
+            return 1
+
+    try:
+        all_values = sheet.get_all_values()
+    except Exception:
+        all_values = []
+
+    header = all_values[0] if all_values else TABLE_HEADERS
+    valid_historical_rows = [
+        r for r in all_values[1:] 
+        if len(r) > 1 and str(r[1]).strip() != ""
+    ]
+
+    # 合併歷史有效資料與本次新增明細
+    combined_rows = valid_historical_rows + new_rows
+    total_records = len(combined_rows)
+
+    # 確保工作表網格空間充足 (資料列 + 表頭 + 10 列緩衝，最少 20 列)
+    needed_grid_rows = max(total_records + 1 + 10, 20)
+    sheet.clear()
+    try:
+        sheet.resize(rows=needed_grid_rows, cols=len(TABLE_HEADERS))
+    except Exception:
+        pass
+
+    # 批次寫入全量乾淨資料
+    write_values = [header] + combined_rows
+    sheet.update(range_name="A1", values=write_values, value_input_option="USER_ENTERED")
+    return total_records + 1
+
+def format_bank_sheet(spreadsheet, sheet, bank_name: str, total_rows: int = None):
+    """
+    為銀行分頁套用專業金融排版、凍結首列、Checkbox、警示條件式格式化與自動欄寬
+    Apply professional financial formatting, freeze row, checkboxes, and auto-resize.
+
+    :param spreadsheet: gspread.Spreadsheet 試算表實例
+    :param sheet: gspread.Worksheet 銀行分頁實例
+    :param bank_name: str 銀行名稱
+    :param total_rows: int 資料列總數 (含表頭)。若未提供，則動態計算真實有效列數
+    """
     sheet_id = sheet.id
+
+    # 動態計算真實資料列數 (以消費日期 B 欄為準)
+    if total_rows is None:
+        try:
+            date_values = sheet.col_values(2)
+            total_rows = len(date_values)
+        except Exception:
+            total_rows = 1
+
     requests = []
 
     # 1. 凍結第 1 列與分頁標籤顏色
@@ -191,13 +307,34 @@ def format_bank_sheet(spreadsheet, sheet, bank_name: str):
         }
     })
 
-    # 3. 資料列預設垂直置中 (Row 1 ~ 1000)
+    # 若僅有表頭或無資料，僅套用自動欄寬後返回
+    if total_rows <= 1:
+        requests.append({
+            "autoResizeDimensions": {
+                "dimensions": {
+                    "sheetId": sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": 0,
+                    "endIndex": len(TABLE_HEADERS)
+                }
+            }
+        })
+        try:
+            spreadsheet.batch_update({"requests": requests})
+        except Exception as e:
+            print(f"    ⚠️ 分頁格式化套用異常 ({bank_name}): {e}")
+        return
+
+    # 動態結尾索引 (0-based exclusive，例如 45 筆明細 + 1 表頭 = 46 列，索引 1~46)
+    end_row_idx = total_rows
+
+    # 3. 資料列預設垂直置中 (Row 1 ~ end_row_idx)
     requests.append({
         "repeatCell": {
             "range": {
                 "sheetId": sheet_id,
                 "startRowIndex": 1,
-                "endRowIndex": 1000,
+                "endRowIndex": end_row_idx,
                 "startColumnIndex": 0,
                 "endColumnIndex": len(TABLE_HEADERS)
             },
@@ -220,7 +357,7 @@ def format_bank_sheet(spreadsheet, sheet, bank_name: str):
             "range": {
                 "sheetId": sheet_id,
                 "startRowIndex": 1,
-                "endRowIndex": 1000,
+                "endRowIndex": end_row_idx,
                 "startColumnIndex": 0,
                 "endColumnIndex": 1
             },
@@ -238,7 +375,7 @@ def format_bank_sheet(spreadsheet, sheet, bank_name: str):
             "range": {
                 "sheetId": sheet_id,
                 "startRowIndex": 1,
-                "endRowIndex": 1000,
+                "endRowIndex": end_row_idx,
                 "startColumnIndex": 0,
                 "endColumnIndex": 1
             },
@@ -257,7 +394,7 @@ def format_bank_sheet(spreadsheet, sheet, bank_name: str):
             "range": {
                 "sheetId": sheet_id,
                 "startRowIndex": 1,
-                "endRowIndex": 1000,
+                "endRowIndex": end_row_idx,
                 "startColumnIndex": 1,
                 "endColumnIndex": 3
             },
@@ -280,7 +417,7 @@ def format_bank_sheet(spreadsheet, sheet, bank_name: str):
             "range": {
                 "sheetId": sheet_id,
                 "startRowIndex": 1,
-                "endRowIndex": 1000,
+                "endRowIndex": end_row_idx,
                 "startColumnIndex": 3,
                 "endColumnIndex": 5
             },
@@ -302,7 +439,7 @@ def format_bank_sheet(spreadsheet, sheet, bank_name: str):
             "range": {
                 "sheetId": sheet_id,
                 "startRowIndex": 1,
-                "endRowIndex": 1000,
+                "endRowIndex": end_row_idx,
                 "startColumnIndex": 5,
                 "endColumnIndex": 6
             },
@@ -321,7 +458,7 @@ def format_bank_sheet(spreadsheet, sheet, bank_name: str):
             "range": {
                 "sheetId": sheet_id,
                 "startRowIndex": 1,
-                "endRowIndex": 1000,
+                "endRowIndex": end_row_idx,
                 "startColumnIndex": 6,
                 "endColumnIndex": 7
             },
@@ -340,7 +477,7 @@ def format_bank_sheet(spreadsheet, sheet, bank_name: str):
             "range": {
                 "sheetId": sheet_id,
                 "startRowIndex": 1,
-                "endRowIndex": 1000,
+                "endRowIndex": end_row_idx,
                 "startColumnIndex": 7,
                 "endColumnIndex": 8
             },
@@ -363,7 +500,7 @@ def format_bank_sheet(spreadsheet, sheet, bank_name: str):
             "range": {
                 "sheetId": sheet_id,
                 "startRowIndex": 1,
-                "endRowIndex": 1000,
+                "endRowIndex": end_row_idx,
                 "startColumnIndex": 8,
                 "endColumnIndex": 9
             },
@@ -380,7 +517,7 @@ def format_bank_sheet(spreadsheet, sheet, bank_name: str):
         }
     })
 
-    # 5. 條件式格式化
+    # 5. 條件式格式化 (依真實資料列數動態設定範圍)
     # 警示 1: 年費/違約金/滯納金/循環利息/利息 -> 紅底紅字警示
     requests.append({
         "addConditionalFormatRule": {
@@ -388,7 +525,7 @@ def format_bank_sheet(spreadsheet, sheet, bank_name: str):
                 "ranges": [{
                     "sheetId": sheet_id,
                     "startRowIndex": 1,
-                    "endRowIndex": 1000,
+                    "endRowIndex": end_row_idx,
                     "startColumnIndex": 0,
                     "endColumnIndex": len(TABLE_HEADERS)
                 }],
@@ -417,7 +554,7 @@ def format_bank_sheet(spreadsheet, sheet, bank_name: str):
                 "ranges": [{
                     "sheetId": sheet_id,
                     "startRowIndex": 1,
-                    "endRowIndex": 1000,
+                    "endRowIndex": end_row_idx,
                     "startColumnIndex": 0,
                     "endColumnIndex": len(TABLE_HEADERS)
                 }],
@@ -1038,11 +1175,8 @@ def main():
         print(f"\n正在將明細寫入各銀行分頁...")
         for b_name, rows in bank_tx_map.items():
             b_sheet = get_or_create_bank_sheet(spreadsheet, b_name, rebuild=args.rebuild)
-            chunk_size = 500
-            for i in range(0, len(rows), chunk_size):
-                chunk = rows[i:i + chunk_size]
-                b_sheet.append_rows(chunk)
-            print(f"  {b_name}: 已寫入 {len(rows)} 筆明細")
+            total_rows = append_bank_transactions(b_sheet, rows)
+            print(f"  {b_name}: 已寫入 {len(rows)} 筆明細 (目前分頁有效筆數: {total_rows - 1})")
 
     # --- 第五階段：更新消費總表動態 QUERY 公式與看板排版 ---
     all_worksheets = spreadsheet.worksheets()
@@ -1051,10 +1185,11 @@ def main():
         if ws.title not in [MASTER_SHEET_TITLE, LOGS_SHEET_TITLE] and not ws.title.startswith("_")
     ]
     
-    print(f"\n正在套用各銀行分頁排版與格式化...")
+    print(f"\n正在套用各銀行分頁排版與格式化 (含自動空行自癒)...")
     for ws in all_worksheets:
         if ws.title in all_bank_tabs:
-            format_bank_sheet(spreadsheet, ws, ws.title)
+            total_rows = compact_bank_sheet_if_needed(spreadsheet, ws)
+            format_bank_sheet(spreadsheet, ws, ws.title, total_rows=total_rows)
 
     format_and_update_master_sheet(spreadsheet, sheet_master, all_bank_tabs)
 
